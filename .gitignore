@@ -1,0 +1,17 @@
+# Compiled binaries
+canvas-scraper
+canvas-scraper-linux
+canvas-scraper.exe
+*.exe
+
+# Secrets and credentials
+.env
+*.env
+storage_state.json
+canvas_session.json
+
+# Output data
+output/
+*.csv
+*grades*.json
+.DS_Store
