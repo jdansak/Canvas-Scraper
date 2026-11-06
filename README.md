@@ -64,17 +64,31 @@ Exports to **JSON**, **CSV**, **interactive single-file HTML reports** (with Dar
 
 ### 1. Download or Build
 
-Download a precompiled binary for your operating system or compile from source:
+Download the pre-compiled binary package for your operating system from the **[GitHub Releases](https://github.com/jdansak/Canvas-Scraper/releases)** page:
+
+| Platform | Architecture | Download Package |
+|---|---|---|
+| **macOS** (Apple Silicon) | `darwin/arm64` | `canvas-scraper-*-darwin-arm64.tar.gz` |
+| **macOS** (Intel) | `darwin/amd64` | `canvas-scraper-*-darwin-amd64.tar.gz` |
+| **Linux** (64-bit) | `linux/amd64` | `canvas-scraper-*-linux-amd64.tar.gz` |
+| **Linux** (ARM64 / Raspberry Pi) | `linux/arm64` | `canvas-scraper-*-linux-arm64.tar.gz` |
+| **Windows** (64-bit) | `windows/amd64` | `canvas-scraper-*-windows-amd64.zip` |
+
+Each package includes the compiled binary, `.env.example`, `README.md`, and `LICENSE`.
+
+Alternatively, make the downloaded binary executable and run it directly:
 
 ```bash
-# macOS (Apple Silicon / arm64)
+# macOS
 chmod +x canvas-scraper
+./canvas-scraper
 
-# Linux (x86_64)
-chmod +x canvas-scraper-linux
+# Linux
+chmod +x canvas-scraper
+./canvas-scraper
 
-# Windows
-# Run canvas-scraper.exe from Command Prompt or PowerShell
+# Windows (Command Prompt or PowerShell)
+.\canvas-scraper.exe
 ```
 
 ### 2. Configure Credentials

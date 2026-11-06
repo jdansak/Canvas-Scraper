@@ -1,0 +1,139 @@
+name: Build and Release Binaries
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release Tag Name (e.g., v1.0.0)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.goos }}/${{ matrix.goarch }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: darwin
+            goarch: arm64
+            output_name: canvas-scraper
+            archive_ext: tar.gz
+          - goos: darwin
+            goarch: amd64
+            output_name: canvas-scraper
+            archive_ext: tar.gz
+          - goos: linux
+            goarch: amd64
+            output_name: canvas-scraper
+            archive_ext: tar.gz
+          - goos: linux
+            goarch: arm64
+            output_name: canvas-scraper
+            archive_ext: tar.gz
+          - goos: windows
+            goarch: amd64
+            output_name: canvas-scraper.exe
+            archive_ext: zip
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          check-latest: true
+
+      - name: Build Binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          go build -ldflags="-s -w" -o "${{ matrix.output_name }}" main.go
+
+      - name: Package Release Archive
+        id: package
+        run: |
+          TAG="${{ github.ref_name }}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.tag_name }}" ]; then
+            TAG="${{ github.event.inputs.tag_name }}"
+          fi
+          if [ -z "$TAG" ] || [ "$TAG" = "main" ]; then
+            TAG="latest"
+          fi
+
+          DIST_NAME="canvas-scraper-${TAG}-${{ matrix.goos }}-${{ matrix.goarch }}"
+          mkdir -p "$DIST_NAME"
+          cp "${{ matrix.output_name }}" "$DIST_NAME/"
+          cp README.md LICENSE .env.example "$DIST_NAME/"
+
+          if [ "${{ matrix.archive_ext }}" = "zip" ]; then
+            zip -r "${DIST_NAME}.zip" "$DIST_NAME"
+            echo "archive=${DIST_NAME}.zip" >> $GITHUB_OUTPUT
+            sha256sum "${DIST_NAME}.zip" > "${DIST_NAME}.zip.sha256"
+          else
+            tar -czvf "${DIST_NAME}.tar.gz" "$DIST_NAME"
+            echo "archive=${DIST_NAME}.tar.gz" >> $GITHUB_OUTPUT
+            sha256sum "${DIST_NAME}.tar.gz" > "${DIST_NAME}.tar.gz.sha256"
+          fi
+
+      - name: Upload Binary Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.archive }}
+          path: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.archive }}.sha256
+          retention-days: 14
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && github.event.inputs.tag_name != '')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Download All Build Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate Checksums File
+        working-directory: release-assets
+        run: |
+          cat *.sha256 > checksums.txt
+          rm -f *.sha256
+
+      - name: Determine Release Tag
+        id: release_info
+        run: |
+          TAG="${{ github.ref_name }}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.tag_name }}" ]; then
+            TAG="${{ github.event.inputs.tag_name }}"
+          fi
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release_info.outputs.tag }}
+          name: "Release ${{ steps.release_info.outputs.tag }}"
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            release-assets/*
