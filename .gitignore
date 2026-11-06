@@ -15,3 +15,4 @@ output/
 *.csv
 *grades*.json
 .DS_Store
+__pycache__/
