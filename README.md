@@ -2,7 +2,8 @@
 
 [![Go Version](https://img.shields.io/badge/Go-1.22+-00ADD8?style=flat&logo=go)](https://go.dev/)
 [![Platform Support](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey?style=flat)]()
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Latest Release](https://img.shields.io/github/v/release/jdansak/Canvas-Scraper?label=latest%20release&logo=github&color=blue)](https://github.com/jdansak/Canvas-Scraper/releases/latest)
+[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 A high-performance, standalone Go tool designed to extract courses, grades, category weights, assignments, and submission details from any **Canvas LMS** institution (`https://<school>.instructure.com`). Supports direct student accounts as well as **Parent / Observer accounts** observing multiple students.
 
@@ -60,36 +61,46 @@ Exports to **JSON**, **CSV**, **interactive single-file HTML reports** (with Dar
 
 ---
 
+## 📥 Download Latest Release
+
+Pre-compiled, standalone binaries are built and published for every release via GitHub Actions. No Go installation required.
+
+| Operating System | Architecture | Package | Direct Download Link |
+|---|---|---|---|
+| 🍏 **macOS** | Apple Silicon (`arm64` - M1/M2/M3/M4) | `.tar.gz` | [**Download for macOS (Apple Silicon)**](https://github.com/jdansak/Canvas-Scraper/releases/latest/download/canvas-scraper-v1.0.0-darwin-arm64.tar.gz) |
+| 🍏 **macOS** | Intel 64-bit (`amd64`) | `.tar.gz` | [**Download for macOS (Intel)**](https://github.com/jdansak/Canvas-Scraper/releases/latest/download/canvas-scraper-v1.0.0-darwin-amd64.tar.gz) |
+| 🐧 **Linux** | 64-bit (`x86_64`) | `.tar.gz` | [**Download for Linux (64-bit)**](https://github.com/jdansak/Canvas-Scraper/releases/latest/download/canvas-scraper-v1.0.0-linux-amd64.tar.gz) |
+| 🐧 **Linux** | ARM64 (`aarch64` / Raspberry Pi) | `.tar.gz` | [**Download for Linux (ARM64)**](https://github.com/jdansak/Canvas-Scraper/releases/latest/download/canvas-scraper-v1.0.0-linux-arm64.tar.gz) |
+| 🪟 **Windows** | 64-bit (`x86_64`) | `.zip` | [**Download for Windows (64-bit .exe)**](https://github.com/jdansak/Canvas-Scraper/releases/latest/download/canvas-scraper-v1.0.0-windows-amd64.zip) |
+
+- 🔗 **Latest Release Landing Page**: [**https://github.com/jdansak/Canvas-Scraper/releases/latest**](https://github.com/jdansak/Canvas-Scraper/releases/latest)
+- 🏷️ **Latest Release Git Tag**: [**https://github.com/jdansak/Canvas-Scraper/releases/tag/latest**](https://github.com/jdansak/Canvas-Scraper/releases/tag/latest)
+- 📜 **All Releases & Checksums**: [**https://github.com/jdansak/Canvas-Scraper/releases**](https://github.com/jdansak/Canvas-Scraper/releases)
+
+---
+
 ## 🚀 Quick Start
 
-### 1. Download or Build
+### 1. Extract and Run
 
-Download the pre-compiled binary package for your operating system from the **[GitHub Releases](https://github.com/jdansak/Canvas-Scraper/releases)** page:
-
-| Platform | Architecture | Download Package |
-|---|---|---|
-| **macOS** (Apple Silicon) | `darwin/arm64` | `canvas-scraper-*-darwin-arm64.tar.gz` |
-| **macOS** (Intel) | `darwin/amd64` | `canvas-scraper-*-darwin-amd64.tar.gz` |
-| **Linux** (64-bit) | `linux/amd64` | `canvas-scraper-*-linux-amd64.tar.gz` |
-| **Linux** (ARM64 / Raspberry Pi) | `linux/arm64` | `canvas-scraper-*-linux-arm64.tar.gz` |
-| **Windows** (64-bit) | `windows/amd64` | `canvas-scraper-*-windows-amd64.zip` |
-
-Each package includes the compiled binary, `.env.example`, `README.md`, and `LICENSE`.
-
-Alternatively, make the downloaded binary executable and run it directly:
-
+#### macOS / Linux
 ```bash
-# macOS
-chmod +x canvas-scraper
-./canvas-scraper
+# 1. Download and extract the archive (example for macOS Apple Silicon)
+tar -xzvf canvas-scraper-*-darwin-arm64.tar.gz
+cd canvas-scraper-*
 
-# Linux
+# 2. Make executable
 chmod +x canvas-scraper
-./canvas-scraper
 
-# Windows (Command Prompt or PowerShell)
-.\canvas-scraper.exe
+# 3. Copy configuration template
+cp .env.example .env
 ```
+
+#### Windows
+1. Download `canvas-scraper-*-windows-amd64.zip`.
+2. Extract the ZIP archive into a folder of your choice.
+3. Copy `.env.example` to `.env` and fill in your credentials.
+4. Run `canvas-scraper.exe` from Command Prompt, PowerShell, or Windows Terminal.
 
 ### 2. Configure Credentials
 

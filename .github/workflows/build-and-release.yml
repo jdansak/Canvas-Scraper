@@ -78,23 +78,25 @@ jobs:
           cp "${{ matrix.output_name }}" "$DIST_NAME/"
           cp README.md LICENSE .env.example "$DIST_NAME/"
 
+          CANONICAL_NAME="canvas-scraper-${{ matrix.goos }}-${{ matrix.goarch }}"
           if [ "${{ matrix.archive_ext }}" = "zip" ]; then
             zip -r "${DIST_NAME}.zip" "$DIST_NAME"
-            echo "archive=${DIST_NAME}.zip" >> $GITHUB_OUTPUT
+            cp "${DIST_NAME}.zip" "${CANONICAL_NAME}.zip"
             sha256sum "${DIST_NAME}.zip" > "${DIST_NAME}.zip.sha256"
+            sha256sum "${CANONICAL_NAME}.zip" > "${CANONICAL_NAME}.zip.sha256"
           else
             tar -czvf "${DIST_NAME}.tar.gz" "$DIST_NAME"
-            echo "archive=${DIST_NAME}.tar.gz" >> $GITHUB_OUTPUT
+            cp "${DIST_NAME}.tar.gz" "${CANONICAL_NAME}.tar.gz"
             sha256sum "${DIST_NAME}.tar.gz" > "${DIST_NAME}.tar.gz.sha256"
+            sha256sum "${CANONICAL_NAME}.tar.gz" > "${CANONICAL_NAME}.tar.gz.sha256"
           fi
 
       - name: Upload Binary Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.package.outputs.archive }}
+          name: artifacts-${{ matrix.goos }}-${{ matrix.goarch }}
           path: |
-            ${{ steps.package.outputs.archive }}
-            ${{ steps.package.outputs.archive }}.sha256
+            canvas-scraper-*.*
           retention-days: 14
 
   release:
@@ -137,3 +139,11 @@ jobs:
           generate_release_notes: true
           files: |
             release-assets/*
+
+      - name: Update 'latest' Git Tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -f latest "${{ steps.release_info.outputs.tag }}"
+          git push -f origin latest
