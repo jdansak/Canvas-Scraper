@@ -74,7 +74,7 @@ Pre-compiled, standalone binaries are built and published for every release via 
 | 🪟 **Windows** | 64-bit (`x86_64`) | `.zip` | [**Download for Windows (64-bit .exe)**](https://github.com/jdansak/Canvas-Scraper/releases/latest/download/canvas-scraper-v1.0.0-windows-amd64.zip) |
 
 - 🔗 **Latest Release Landing Page**: [**https://github.com/jdansak/Canvas-Scraper/releases/latest**](https://github.com/jdansak/Canvas-Scraper/releases/latest)
-- 🏷️ **Latest Release Git Tag**: [**https://github.com/jdansak/Canvas-Scraper/releases/tag/latest**](https://github.com/jdansak/Canvas-Scraper/releases/tag/latest)
+
 - 📜 **All Releases & Checksums**: [**https://github.com/jdansak/Canvas-Scraper/releases**](https://github.com/jdansak/Canvas-Scraper/releases)
 
 ---
@@ -306,7 +306,7 @@ GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o canvas-scraper-linux main.g
 Because `canvas-scraper` is a single static executable, you can easily run it on a recurring schedule to generate fresh daily grade summaries or alerts.
 
 ### Example: macOS / Linux Cron Job
-Run every weekday at 4:00 PM and output an updated HTML and Markdown report:
+Run every weekday at 4:00 PM and output an updated  Markdown report:
 
 ```bash
 # Edit crontab
