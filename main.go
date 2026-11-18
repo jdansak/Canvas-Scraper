@@ -29,7 +29,7 @@ import (
 )
 
 // Version is the current release version of canvas-scraper (overridable via -ldflags "-X main.Version=...").
-var Version = "v1.1.1"
+var Version = "v1.1.2"
 
 const (
 	SessionFile       = "storage_state.json"
@@ -2891,9 +2891,11 @@ func exportHTML(outputDir string, data []CourseGradeRecord, cacheNotice string) 
 				pctDisp = fmt.Sprintf("%.1f%%", *a.Percentage)
 			}
 
-			catDisp := a.GroupName
+			catCellHTML := html.EscapeString(strings.Join(strings.Fields(a.GroupName), " "))
 			if a.GroupWeightPercent > 0 {
-				catDisp = fmt.Sprintf("%s (%s%%)", a.GroupName, formatFloatTrim(a.GroupWeightPercent))
+				r, g, b := weightGradientRGB(a.GroupWeightPercent)
+				catCellHTML = fmt.Sprintf(`<span style="display:flex;justify-content:space-between;align-items:center;gap:0.5rem;"><span>%s</span><span class="badge" style="background:rgba(%d,%d,%d,0.16);color:rgb(%d,%d,%d);border:1px solid rgba(%d,%d,%d,0.35);font-variant-numeric:tabular-nums;">%s%%</span></span>`,
+					catCellHTML, r, g, b, r, g, b, r, g, b, html.EscapeString(formatFloatTrim(a.GroupWeightPercent)))
 			}
 
 			dueDisp := "-"
@@ -2927,7 +2929,7 @@ func exportHTML(outputDir string, data []CourseGradeRecord, cacheNotice string) 
             </tr>
 `,
 				nameCell,
-				html.EscapeString(catDisp),
+				catCellHTML,
 				html.EscapeString(scoreDisp),
 				html.EscapeString(pctDisp),
 				statusBadge,
@@ -2966,6 +2968,51 @@ func truncate(s string, maxLen int) string {
 	return string(runes[:maxLen-1]) + "…"
 }
 
+// weightGradientRGB returns a smooth 24-bit RGB color interpolated from cool sky-blue (low weight)
+// through teal and warm amber to vibrant coral/magenta (high weight).
+func weightGradientRGB(weightPct float64) (int, int, int) {
+	type colorStop struct {
+		pct     float64
+		r, g, b float64
+	}
+	stops := []colorStop{
+		{5.0, 100, 181, 246},  // #64B5F6 Cool Sky Blue
+		{20.0, 77, 208, 225},  // #4DD0E1 Bright Teal
+		{35.0, 255, 202, 40},  // #FFCA28 Warm Gold / Amber
+		{50.0, 255, 112, 67},  // #FF7043 Vibrant Coral-Orange
+		{65.0, 240, 98, 146},  // #F06292 Hot Magenta-Rose
+	}
+	if weightPct <= stops[0].pct {
+		return int(stops[0].r), int(stops[0].g), int(stops[0].b)
+	}
+	last := stops[len(stops)-1]
+	if weightPct >= last.pct {
+		return int(last.r), int(last.g), int(last.b)
+	}
+	for i := 0; i < len(stops)-1; i++ {
+		a, b := stops[i], stops[i+1]
+		if weightPct >= a.pct && weightPct <= b.pct {
+			t := (weightPct - a.pct) / (b.pct - a.pct)
+			r := int(math.Round(a.r + t*(b.r-a.r)))
+			g := int(math.Round(a.g + t*(b.g-a.g)))
+			bl := int(math.Round(a.b + t*(b.b-a.b)))
+			return r, g, bl
+		}
+	}
+	return int(last.r), int(last.g), int(last.b)
+}
+
+func weightGradientANSI(weightPct float64, bold bool) string {
+	if weightPct <= 0 {
+		return ColorDim
+	}
+	r, g, b := weightGradientRGB(weightPct)
+	if bold {
+		return fmt.Sprintf("\033[1;38;2;%d;%d;%dm", r, g, b)
+	}
+	return fmt.Sprintf("\033[38;2;%d;%d;%dm", r, g, b)
+}
+
 // formatCategoryWithWeight formats a category name and its weight percentage,
 // truncating only the category name when maxLen > 0 so that "(##%)" is always visible.
 func formatCategoryWithWeight(groupName string, weightPct float64, maxLen int) string {
@@ -2989,8 +3036,39 @@ func formatCategoryWithWeight(groupName string, weightPct float64, maxLen int) s
 	return truncate(name, nameBudget) + suffix
 }
 
+// formatCategoryColumnANSI formats a fixed-width Category (Weight) cell with:
+//   - the category name left-aligned (truncated if needed),
+//   - the "(##%)" weight right-aligned so all weights line up vertically, and
+//   - a smooth 24-bit TrueColor heat gradient based on weightPct.
+func formatCategoryColumnANSI(groupName string, weightPct float64, width int) string {
+	name := strings.Join(strings.Fields(groupName), " ")
+	if weightPct <= 0 {
+		trunc := truncate(name, width)
+		pad := width - len([]rune(trunc))
+		if pad < 0 {
+			pad = 0
+		}
+		return ColorDim + trunc + strings.Repeat(" ", pad) + ColorReset
+	}
+	weightTag := fmt.Sprintf("(%s%%)", formatFloatTrim(weightPct))
+	tagLen := len([]rune(weightTag))
+	nameBudget := width - tagLen - 1
+	if nameBudget < 1 {
+		nameBudget = 1
+	}
+	truncName := truncate(name, nameBudget)
+	padSpaces := width - len([]rune(truncName)) - tagLen
+	if padSpaces < 1 {
+		padSpaces = 1
+	}
+	nameColor := weightGradientANSI(weightPct, false)
+	tagColor := weightGradientANSI(weightPct, true)
+	return nameColor + truncName + strings.Repeat(" ", padSpaces) + tagColor + weightTag + ColorReset
+}
+
 // formatWeightCategoriesOverview formats all weighted categories for the overview table,
-// compacting long category names so every category's "(##%)" weight stays visible.
+// compacting long category names so every category's "(##%)" weight stays visible and
+// applying the smooth 24-bit TrueColor weight gradient to each category.
 func formatWeightCategoriesOverview(groups []AssignmentGroupRecord, maxLen int) string {
 	var weighted []AssignmentGroupRecord
 	seen := make(map[string]bool)
@@ -3004,29 +3082,43 @@ func formatWeightCategoriesOverview(groups []AssignmentGroupRecord, maxLen int) 
 		}
 	}
 	if len(weighted) == 0 {
-		return "Unweighted / Points"
+		return ColorDim + "Unweighted / Points" + ColorReset
 	}
 
-	buildWithLimit := func(perItemMax int) string {
+	buildPlainWithLimit := func(perItemMax int) []string {
 		parts := make([]string, 0, len(weighted))
 		for _, g := range weighted {
 			parts = append(parts, formatCategoryWithWeight(g.Name, g.WeightPercent, perItemMax))
 		}
-		return strings.Join(parts, ", ")
+		return parts
 	}
 
-	full := buildWithLimit(0)
-	if maxLen <= 0 || len([]rune(full)) <= maxLen {
-		return full
-	}
-
-	for limit := 28; limit >= 8; limit-- {
-		candidate := buildWithLimit(limit)
-		if len([]rune(candidate)) <= maxLen {
-			return candidate
+	chosenLimit := 0
+	full := strings.Join(buildPlainWithLimit(0), ", ")
+	if maxLen > 0 && len([]rune(full)) > maxLen {
+		chosenLimit = 8
+		for limit := 28; limit >= 8; limit-- {
+			candidate := strings.Join(buildPlainWithLimit(limit), ", ")
+			if len([]rune(candidate)) <= maxLen {
+				chosenLimit = limit
+				break
+			}
 		}
 	}
-	return buildWithLimit(8)
+
+	plainParts := buildPlainWithLimit(chosenLimit)
+	coloredParts := make([]string, 0, len(plainParts))
+	for i, part := range plainParts {
+		wPct := weighted[i].WeightPercent
+		nameColor := weightGradientANSI(wPct, false)
+		tagColor := weightGradientANSI(wPct, true)
+		if idx := strings.LastIndex(part, " ("); idx != -1 {
+			coloredParts = append(coloredParts, nameColor+part[:idx]+" "+tagColor+part[idx+1:]+ColorReset)
+		} else {
+			coloredParts = append(coloredParts, nameColor+part+ColorReset)
+		}
+	}
+	return strings.Join(coloredParts, ", ")
 }
 
 func displayTerminalSummary(data []CourseGradeRecord, cacheNotice string, filterActive bool) {
@@ -3138,7 +3230,7 @@ func displayTerminalSummary(data []CourseGradeRecord, cacheNotice string, filter
 				pctDisp = fmt.Sprintf("%.1f%%", *a.Percentage)
 			}
 
-			catDisp := formatCategoryWithWeight(a.GroupName, a.GroupWeightPercent, 24)
+			catColANSI := formatCategoryColumnANSI(a.GroupName, a.GroupWeightPercent, 24)
 
 			dueDisp := "-"
 			if a.DueAt != nil && len(*a.DueAt) >= 10 {
@@ -3155,9 +3247,9 @@ func displayTerminalSummary(data []CourseGradeRecord, cacheNotice string, filter
 				statusColor = ColorCyan
 			}
 
-			fmt.Printf("│ %-38s │ %-24s │ %10s │ %8s │ %s%-14s%s │ %10s\n",
+			fmt.Printf("│ %-38s │ %s │ %10s │ %8s │ %s%-14s%s │ %10s\n",
 				truncate(a.Name, 38),
-				catDisp,
+				catColANSI,
 				scoreDisp,
 				pctDisp,
 				statusColor, truncate(a.Status, 14), ColorReset,
