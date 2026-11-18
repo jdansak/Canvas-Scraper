@@ -29,7 +29,7 @@ import (
 )
 
 // Version is the current release version of canvas-scraper (overridable via -ldflags "-X main.Version=...").
-var Version = "v1.1.0"
+var Version = "v1.1.1"
 
 const (
 	SessionFile       = "storage_state.json"
@@ -2966,6 +2966,69 @@ func truncate(s string, maxLen int) string {
 	return string(runes[:maxLen-1]) + "…"
 }
 
+// formatCategoryWithWeight formats a category name and its weight percentage,
+// truncating only the category name when maxLen > 0 so that "(##%)" is always visible.
+func formatCategoryWithWeight(groupName string, weightPct float64, maxLen int) string {
+	name := strings.Join(strings.Fields(groupName), " ")
+	if weightPct <= 0 {
+		if maxLen > 0 {
+			return truncate(name, maxLen)
+		}
+		return name
+	}
+	suffix := fmt.Sprintf(" (%s%%)", formatFloatTrim(weightPct))
+	full := name + suffix
+	if maxLen <= 0 || len([]rune(full)) <= maxLen {
+		return full
+	}
+	suffixLen := len([]rune(suffix))
+	nameBudget := maxLen - suffixLen
+	if nameBudget <= 1 {
+		return truncate(strings.TrimSpace(suffix), maxLen)
+	}
+	return truncate(name, nameBudget) + suffix
+}
+
+// formatWeightCategoriesOverview formats all weighted categories for the overview table,
+// compacting long category names so every category's "(##%)" weight stays visible.
+func formatWeightCategoriesOverview(groups []AssignmentGroupRecord, maxLen int) string {
+	var weighted []AssignmentGroupRecord
+	seen := make(map[string]bool)
+	for _, g := range groups {
+		if g.WeightPercent > 0 {
+			key := fmt.Sprintf("%s|%s", strings.Join(strings.Fields(g.Name), " "), formatFloatTrim(g.WeightPercent))
+			if !seen[key] {
+				seen[key] = true
+				weighted = append(weighted, g)
+			}
+		}
+	}
+	if len(weighted) == 0 {
+		return "Unweighted / Points"
+	}
+
+	buildWithLimit := func(perItemMax int) string {
+		parts := make([]string, 0, len(weighted))
+		for _, g := range weighted {
+			parts = append(parts, formatCategoryWithWeight(g.Name, g.WeightPercent, perItemMax))
+		}
+		return strings.Join(parts, ", ")
+	}
+
+	full := buildWithLimit(0)
+	if maxLen <= 0 || len([]rune(full)) <= maxLen {
+		return full
+	}
+
+	for limit := 28; limit >= 8; limit-- {
+		candidate := buildWithLimit(limit)
+		if len([]rune(candidate)) <= maxLen {
+			return candidate
+		}
+	}
+	return buildWithLimit(8)
+}
+
 func displayTerminalSummary(data []CourseGradeRecord, cacheNotice string, filterActive bool) {
 	fmt.Println()
 	if cacheNotice != "" {
@@ -2999,21 +3062,7 @@ func displayTerminalSummary(data []CourseGradeRecord, cacheNotice string, filter
 			}
 		}
 
-		var weights []string
-		seenW := make(map[string]bool)
-		for _, g := range c.AssignmentGroups {
-			if g.WeightPercent > 0 {
-				lbl := fmt.Sprintf("%s (%s%%)", g.Name, formatFloatTrim(g.WeightPercent))
-				if !seenW[lbl] {
-					seenW[lbl] = true
-					weights = append(weights, lbl)
-				}
-			}
-		}
-		weightStr := "Unweighted / Points"
-		if len(weights) > 0 {
-			weightStr = strings.Join(weights, ", ")
-		}
+		weightStr := formatWeightCategoriesOverview(c.AssignmentGroups, 52)
 
 		fmt.Printf("%s%-16s%s │ %s%-26s%s │ %s%10s%s │ %s%5s%s │ %s%11s%s │ %5d │ %s\n",
 			ColorBoldCyan, truncate(c.StudentName, 16), ColorReset,
@@ -3022,7 +3071,7 @@ func displayTerminalSummary(data []CourseGradeRecord, cacheNotice string, filter
 			ColorBoldYellow, gradeStr, ColorReset,
 			trendColor, trendStr, ColorReset,
 			len(c.Assignments),
-			truncate(weightStr, 46),
+			weightStr,
 		)
 	}
 	fmt.Println(strings.Repeat("─", 124))
@@ -3089,10 +3138,7 @@ func displayTerminalSummary(data []CourseGradeRecord, cacheNotice string, filter
 				pctDisp = fmt.Sprintf("%.1f%%", *a.Percentage)
 			}
 
-			catDisp := a.GroupName
-			if a.GroupWeightPercent > 0 {
-				catDisp = fmt.Sprintf("%s (%s%%)", a.GroupName, formatFloatTrim(a.GroupWeightPercent))
-			}
+			catDisp := formatCategoryWithWeight(a.GroupName, a.GroupWeightPercent, 24)
 
 			dueDisp := "-"
 			if a.DueAt != nil && len(*a.DueAt) >= 10 {
@@ -3111,7 +3157,7 @@ func displayTerminalSummary(data []CourseGradeRecord, cacheNotice string, filter
 
 			fmt.Printf("│ %-38s │ %-24s │ %10s │ %8s │ %s%-14s%s │ %10s\n",
 				truncate(a.Name, 38),
-				truncate(catDisp, 24),
+				catDisp,
 				scoreDisp,
 				pctDisp,
 				statusColor, truncate(a.Status, 14), ColorReset,
