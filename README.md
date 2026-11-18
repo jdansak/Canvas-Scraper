@@ -14,6 +14,7 @@ Exports to **JSON**, **CSV**, **interactive single-file HTML reports** (with Dar
 ## 🌟 Key Features
 
 - 🎓 **Full Gradebook Extraction**: Captures overall course scores, letter grades, grading periods, assignment category weights (e.g. *Tests 55%*, *Quizzes 35%*, *Homework 10%*), and individual assignment statuses.
+- 📈 **Grade History & Week-over-Week (WoW) Trending**: Automatically tracks course grade snapshots over time (`grade_history.json` / `grade_history.csv`) and reconstructs historical weekly grades from assignment `graded_at` timestamps and category weights on Day 1. Displays color-coded `Trend (WoW)` indicators (`▲ +0.50%`, `▼ -1.20%`, `▬ 0.00%`), multi-week grade trajectories (`74.2% (Sep 19) ──► ... ──► 75.8% (Oct 31) ──► 76.3% (Now)`), and inline SVG sparklines in `--web`.
 - 👨‍👩‍👧‍👦 **Parent / Observer Support**: Automatically discovers all observed students (e.g., observing multiple children) and maps their enrollments and submissions into clean, per-student breakdowns.
 - ⚡ **Smart Two-Tier Session & Data Caching**:
   - **Session Persistence (`storage_state.json`)**: Performs browser login once via headless Chrome (`chromedp`), extracts authentication cookies in Playwright-compatible format, and reuses them directly over lightweight HTTP without launching Chrome again.
@@ -67,11 +68,11 @@ Pre-compiled, standalone binaries are built and published for every release via 
 
 | Operating System | Architecture | Package | Direct Download Link |
 |---|---|---|---|
-| 🍏 **macOS** | Apple Silicon (`arm64` - M1/M2/M3/M4) | `.tar.gz` | [**Download for macOS (Apple Silicon)**](https://github.com/jdansak/Canvas-Scraper/releases/latest/download/canvas-scraper-v1.0.0-darwin-arm64.tar.gz) |
-| 🍏 **macOS** | Intel 64-bit (`amd64`) | `.tar.gz` | [**Download for macOS (Intel)**](https://github.com/jdansak/Canvas-Scraper/releases/latest/download/canvas-scraper-v1.0.0-darwin-amd64.tar.gz) |
-| 🐧 **Linux** | 64-bit (`x86_64`) | `.tar.gz` | [**Download for Linux (64-bit)**](https://github.com/jdansak/Canvas-Scraper/releases/latest/download/canvas-scraper-v1.0.0-linux-amd64.tar.gz) |
-| 🐧 **Linux** | ARM64 (`aarch64` / Raspberry Pi) | `.tar.gz` | [**Download for Linux (ARM64)**](https://github.com/jdansak/Canvas-Scraper/releases/latest/download/canvas-scraper-v1.0.0-linux-arm64.tar.gz) |
-| 🪟 **Windows** | 64-bit (`x86_64`) | `.zip` | [**Download for Windows (64-bit .exe)**](https://github.com/jdansak/Canvas-Scraper/releases/latest/download/canvas-scraper-v1.0.0-windows-amd64.zip) |
+| 🍏 **macOS** | Apple Silicon (`arm64` - M1/M2/M3/M4) | `.tar.gz` | [**Download for macOS (Apple Silicon)**](https://github.com/jdansak/Canvas-Scraper/releases/latest/download/canvas-scraper-darwin-arm64.tar.gz) |
+| 🍏 **macOS** | Intel 64-bit (`amd64`) | `.tar.gz` | [**Download for macOS (Intel)**](https://github.com/jdansak/Canvas-Scraper/releases/latest/download/canvas-scraper-darwin-amd64.tar.gz) |
+| 🐧 **Linux** | 64-bit (`x86_64`) | `.tar.gz` | [**Download for Linux (64-bit)**](https://github.com/jdansak/Canvas-Scraper/releases/latest/download/canvas-scraper-linux-amd64.tar.gz) |
+| 🐧 **Linux** | ARM64 (`aarch64` / Raspberry Pi) | `.tar.gz` | [**Download for Linux (ARM64)**](https://github.com/jdansak/Canvas-Scraper/releases/latest/download/canvas-scraper-linux-arm64.tar.gz) |
+| 🪟 **Windows** | 64-bit (`x86_64`) | `.zip` | [**Download for Windows (64-bit .exe)**](https://github.com/jdansak/Canvas-Scraper/releases/latest/download/canvas-scraper-windows-amd64.zip) |
 
 - 🔗 **Latest Release Landing Page**: [**https://github.com/jdansak/Canvas-Scraper/releases/latest**](https://github.com/jdansak/Canvas-Scraper/releases/latest)
 
@@ -168,7 +169,8 @@ Configuration settings can be provided in multiple places. The scraper merges th
 | `CACHE_TIMER` | Duration | `10m` | Local data cache duration (`30s`, `10m`, `2h`, `7d`, or `0` to disable) |
 | `SKIP_NONGRADED` | Boolean | `true` | Skip non-graded courses (counseling, homeroom, study hall) |
 | `SKIP_UNGRADED_ITEMS` | Boolean | `true` | Filter out "Not Graded" / 0% weight categories and assignments |
-| `SORT_BY` | String | Empty | Default sorting order across reports (`date`, `status`, `score`, `grade`, `weight`) |
+| `DISABLE_TREND` | Boolean | `false` | Disable grade history logging and Week-over-Week trend calculation (`--no-trend`) |
+| `SORT_BY` | String | Empty | Default sorting order across reports (`date`, `status`, `score`, `grade`, `trend`, `weight`) |
 | `HIDE_FUTURE_DUE` | Boolean | `false` | Exclude ungraded assignments with future due dates |
 | `FUTURE_ONLY` | Boolean | `false` | Show only assignments with future due dates |
 | `DUE_WITHIN` | Duration | Empty | Show only assignments due within duration (e.g. `7d`, `14d`, `48h`) |
@@ -188,6 +190,9 @@ Run `./canvas-scraper --help` at any time to view the built-in reference.
 ### General & Output Flags
 
 ```bash
+# Check installed version
+./canvas-scraper --version
+
 # Bypass local cache and force live Canvas fetch
 ./canvas-scraper --fresh
 
@@ -248,6 +253,10 @@ All filtering flags operate instantaneously against your cached data without re-
 
 # Sort courses & assignments by letter grade (A -> F)
 ./canvas-scraper --sort grade
+
+# Sort courses by Week-over-Week grade trend (biggest drops first, or biggest gains with trend-desc)
+./canvas-scraper --sort trend
+./canvas-scraper --sort trend-desc
 ```
 
 ---
@@ -260,8 +269,10 @@ All outputs are written to the configured `OUTPUT_DIR` (default: `output/`):
 |---|---|---|
 | `canvas_grades.html` | HTML5 | **Interactive Web Dashboard** generated by `--web`. Self-contained with zero external CSS/JS dependencies, responsive container queries, sticky column headers, and dark mode support. |
 | `canvas_grades.md` | Markdown | **AI / LLM Analysis Document** generated by `--markdown`. Contains report metadata, an executive summary table, a pre-extracted **Action Items** section (all missing, overdue, and late items), and full per-course breakdowns. |
-| `canvas_grades.json` | JSON | Complete structured export containing raw student IDs, course metadata, assignment group weighting rules, and individual assignment submission histories. |
-| `courses_summary.csv` | CSV | High-level spreadsheet of all courses, students, grading periods, current percentage scores, and letter grades. |
+| `canvas_grades.json` | JSON | Complete structured export containing raw student IDs, course metadata, `trend` (WoW delta & history points), assignment group weighting rules, and individual assignment submission histories. |
+| `courses_summary.csv` | CSV | High-level spreadsheet of all courses, students, grading periods, current percentage scores, letter grades, `Trend (WoW)`, and `Previous Score (%)`. |
+| `grade_history.json` | JSON | Append-only historical grade timeseries storing dated snapshots (`scraped` and `reconstructed`) per student and course. |
+| `grade_history.csv` | CSV | Spreadsheet timeseries of historical course grades across dates for charting in Excel or Google Sheets. |
 | `assignment_weights.csv` | CSV | Breakdown of every assignment group/category and its exact percentage weight per course. |
 | `assignments_detail.csv` | CSV | Comprehensive table of every single assignment, due date, points earned, points possible, percentage, category, status, and grading date. |
 | `.cache_raw.json` | JSON | Internal cache envelope recording raw scrape data and precise ISO timestamps for `CACHE_TIMER` validation. |

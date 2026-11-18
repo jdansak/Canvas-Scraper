@@ -28,6 +28,9 @@ import (
 	"github.com/chromedp/chromedp"
 )
 
+// Version is the current release version of canvas-scraper (overridable via -ldflags "-X main.Version=...").
+var Version = "v1.1.0"
+
 const (
 	SessionFile       = "storage_state.json"
 	DefaultOutputDir  = "output"
@@ -78,8 +81,40 @@ type CourseGradeRecord struct {
 	OverallScore     *float64                `json:"overall_score"`
 	OverallGrade     *string                 `json:"overall_grade"`
 	FinalScore       *float64                `json:"final_score"`
+	Trend            *CourseTrend            `json:"trend,omitempty"`
 	AssignmentGroups []AssignmentGroupRecord `json:"assignment_groups"`
 	Assignments      []AssignmentRecord      `json:"assignments"`
+}
+
+// GradeSnapshot represents a point-in-time course grade observation persisted in grade_history.json.
+type GradeSnapshot struct {
+	Timestamp   time.Time `json:"timestamp"`
+	StudentID   int       `json:"student_id"`
+	StudentName string    `json:"student_name"`
+	CourseID    int       `json:"course_id"`
+	CourseName  string    `json:"course_name"`
+	Score       float64   `json:"score"`
+	Grade       string    `json:"grade"`
+	Source      string    `json:"source"` // "scraped" or "reconstructed"
+}
+
+// HistoryPoint represents a concise date/score milestone for trend progression and sparklines.
+type HistoryPoint struct {
+	Date   string  `json:"date"`
+	Score  float64 `json:"score"`
+	Grade  string  `json:"grade,omitempty"`
+	Source string  `json:"source,omitempty"`
+}
+
+// CourseTrend holds the Week-over-Week (WoW) delta and historical grade progression for a course.
+type CourseTrend struct {
+	PreviousScore  *float64       `json:"previous_score,omitempty"`
+	PreviousGrade  string         `json:"previous_grade,omitempty"`
+	PreviousDate   string         `json:"previous_date,omitempty"`
+	DeltaWoW       *float64       `json:"delta_wow,omitempty"`
+	Direction      string         `json:"direction"`       // "up", "down", "flat", "new"
+	FormattedDelta string         `json:"formatted_delta"` // e.g., "▲ +0.50%", "▼ -1.20%", "▬ 0.00%", "-"
+	HistoryPoints  []HistoryPoint `json:"history_points,omitempty"`
 }
 
 type AssignmentGroupRecord struct {
@@ -207,8 +242,9 @@ type AppConfig struct {
 	ScoreBelow        float64 // <= 0 means disabled
 	MinCategoryWeight float64 // <= 0 means disabled
 
-	// Sorting
-	SortBy string
+	// Sorting & Trending
+	SortBy       string
+	DisableTrend bool
 }
 
 // dotEnvSearchPaths returns candidate .env locations in priority order (highest first):
@@ -401,6 +437,7 @@ func loadConfigFromEnv() AppConfig {
 		MissingAfterDays:  -1,
 		StatusFilter:      strings.TrimSpace(os.Getenv("STATUS_FILTER")),
 		SortBy:            strings.TrimSpace(os.Getenv("SORT_BY")),
+		DisableTrend:      parseEnvBool("DISABLE_TREND"),
 	}
 
 	if timerRaw := strings.TrimSpace(os.Getenv("CACHE_TIMER")); timerRaw != "" && timerRaw != "0" && !strings.EqualFold(timerRaw, "false") {
@@ -1073,7 +1110,7 @@ func applySorting(data []CourseGradeRecord, sortRaw string) []CourseGradeRecord 
 			tB, hasB := parseDueTime(b.DueAt)
 
 			switch s {
-			case "date", "due", "date-asc", "due-asc":
+			case "date", "due", "date-asc", "due-asc", "trend", "trend-asc", "trend-desc":
 				if hasA != hasB {
 					return hasA // items with a due date come before items with no due date
 				}
@@ -1198,6 +1235,24 @@ func applySorting(data []CourseGradeRecord, sortRaw string) []CourseGradeRecord 
 			}
 			if hasI && *result[i].OverallScore != *result[j].OverallScore {
 				return *result[i].OverallScore > *result[j].OverallScore
+			}
+			return result[i].CourseName < result[j].CourseName
+		})
+	case "trend", "trend-asc", "trend-desc":
+		sort.SliceStable(result, func(i, j int) bool {
+			if result[i].StudentName != result[j].StudentName {
+				return result[i].StudentName < result[j].StudentName
+			}
+			hasI := result[i].Trend != nil && result[i].Trend.DeltaWoW != nil
+			hasJ := result[j].Trend != nil && result[j].Trend.DeltaWoW != nil
+			if hasI != hasJ {
+				return hasI
+			}
+			if hasI && *result[i].Trend.DeltaWoW != *result[j].Trend.DeltaWoW {
+				if s == "trend-desc" {
+					return *result[i].Trend.DeltaWoW > *result[j].Trend.DeltaWoW
+				}
+				return *result[i].Trend.DeltaWoW < *result[j].Trend.DeltaWoW
 			}
 			return result[i].CourseName < result[j].CourseName
 		})
@@ -1431,6 +1486,513 @@ func formatFloatTrim(v float64) string {
 	return strconv.FormatFloat(v, 'f', -1, 64)
 }
 
+func scoreToLetterGrade(score float64) string {
+	switch {
+	case score >= 90.0:
+		return "A"
+	case score >= 80.0:
+		return "B"
+	case score >= 70.0:
+		return "C"
+	case score >= 60.0:
+		return "D"
+	default:
+		return "F"
+	}
+}
+
+func effectiveGradedTime(a AssignmentRecord) (time.Time, bool) {
+	if t, ok := parseDueTime(a.GradedAt); ok {
+		return t, true
+	}
+	if t, ok := parseDueTime(a.DueAt); ok {
+		return t, true
+	}
+	if t, ok := parseDueTime(a.SubmittedAt); ok {
+		return t, true
+	}
+	return time.Time{}, false
+}
+
+func computeCourseScoreAt(c CourseGradeRecord, cutoff time.Time) (float64, bool) {
+	type groupTotals struct {
+		earned   float64
+		possible float64
+	}
+	byGroup := make(map[int]*groupTotals)
+	var totalEarned, totalPossible float64
+	gradedCount := 0
+
+	for _, a := range c.Assignments {
+		if a.Score == nil || a.PointsPossible == nil || *a.PointsPossible <= 0 || a.Excused || a.OmitFromFinalGrade {
+			continue
+		}
+		t, ok := effectiveGradedTime(a)
+		if !ok || t.After(cutoff) {
+			continue
+		}
+		gt, exists := byGroup[a.GroupID]
+		if !exists {
+			gt = &groupTotals{}
+			byGroup[a.GroupID] = gt
+		}
+		gt.earned += *a.Score
+		gt.possible += *a.PointsPossible
+		totalEarned += *a.Score
+		totalPossible += *a.PointsPossible
+		gradedCount++
+	}
+
+	if gradedCount == 0 || totalPossible <= 0 {
+		return 0, false
+	}
+
+	totalGroupWeight := 0.0
+	for _, g := range c.AssignmentGroups {
+		if g.WeightPercent > 0 {
+			totalGroupWeight += g.WeightPercent
+		}
+	}
+
+	if totalGroupWeight > 0 {
+		weightedSum := 0.0
+		activeWeight := 0.0
+		for _, g := range c.AssignmentGroups {
+			if g.WeightPercent <= 0 {
+				continue
+			}
+			if gt, exists := byGroup[g.ID]; exists && gt.possible > 0 {
+				groupPct := (gt.earned / gt.possible) * 100.0
+				weightedSum += groupPct * g.WeightPercent
+				activeWeight += g.WeightPercent
+			}
+		}
+		if activeWeight > 0 {
+			return weightedSum / activeWeight, true
+		}
+	}
+
+	return (totalEarned / totalPossible) * 100.0, true
+}
+
+func reconstructCourseHistory(c CourseGradeRecord, now time.Time) []GradeSnapshot {
+	if c.OverallScore == nil {
+		return nil
+	}
+
+	var earliest time.Time
+	var secondLatest time.Time
+	var latest time.Time
+	for _, a := range c.Assignments {
+		if a.Score == nil || a.PointsPossible == nil || *a.PointsPossible <= 0 || a.Excused || a.OmitFromFinalGrade {
+			continue
+		}
+		if t, ok := effectiveGradedTime(a); ok && !t.After(now) {
+			if earliest.IsZero() || t.Before(earliest) {
+				earliest = t
+			}
+			if latest.IsZero() || t.After(latest) {
+				secondLatest = latest
+				latest = t
+			} else if t.Before(latest) && (secondLatest.IsZero() || t.After(secondLatest)) {
+				secondLatest = t
+			}
+		}
+	}
+	if earliest.IsZero() {
+		return nil
+	}
+
+	rawNow, hasNow := computeCourseScoreAt(c, now)
+	offset := 0.0
+	if hasNow {
+		offset = *c.OverallScore - rawNow
+	}
+
+	var snapshots []GradeSnapshot
+	for weeksAgo := 12; weeksAgo >= 1; weeksAgo-- {
+		checkpoint := now.Add(-time.Duration(weeksAgo*7) * 24 * time.Hour)
+		if checkpoint.Before(earliest) {
+			continue
+		}
+		rawAt, ok := computeCourseScoreAt(c, checkpoint)
+		if !ok {
+			continue
+		}
+		var calibrated float64
+		if math.Abs(rawAt-rawNow) < 1e-6 {
+			calibrated = *c.OverallScore
+		} else {
+			calibrated = rawAt + offset
+		}
+		if calibrated < 0 {
+			calibrated = 0
+		} else if calibrated > 150 {
+			calibrated = 150
+		}
+		calibrated = math.Round(calibrated*100) / 100
+		snapshots = append(snapshots, GradeSnapshot{
+			Timestamp:   checkpoint.UTC(),
+			StudentID:   c.StudentID,
+			StudentName: c.StudentName,
+			CourseID:    c.CourseID,
+			CourseName:  c.CourseName,
+			Score:       calibrated,
+			Grade:       scoreToLetterGrade(calibrated),
+			Source:      "reconstructed",
+		})
+	}
+
+	// Fallback if all graded assignments occurred within the last 7 days but across multiple timestamps
+	if len(snapshots) == 0 && !secondLatest.IsZero() {
+		checkpoint := secondLatest.Add(time.Second)
+		if rawAt, ok := computeCourseScoreAt(c, checkpoint); ok {
+			calibrated := math.Round((rawAt+offset)*100) / 100
+			if calibrated >= 0 && calibrated <= 150 {
+				snapshots = append(snapshots, GradeSnapshot{
+					Timestamp:   checkpoint.UTC(),
+					StudentID:   c.StudentID,
+					StudentName: c.StudentName,
+					CourseID:    c.CourseID,
+					CourseName:  c.CourseName,
+					Score:       calibrated,
+					Grade:       scoreToLetterGrade(calibrated),
+					Source:      "reconstructed",
+				})
+			}
+		}
+	}
+
+	return snapshots
+}
+
+func loadGradeHistory(historyJSONPath string) []GradeSnapshot {
+	raw, err := os.ReadFile(historyJSONPath)
+	if err != nil {
+		return nil
+	}
+	var snaps []GradeSnapshot
+	if err := json.Unmarshal(raw, &snaps); err != nil {
+		return nil
+	}
+	return snaps
+}
+
+func deduplicateSnapshots(snaps []GradeSnapshot) []GradeSnapshot {
+	type snapKey struct {
+		studentID int
+		courseID  int
+		dateStr   string
+	}
+	byKey := make(map[snapKey]GradeSnapshot)
+	for _, s := range snaps {
+		k := snapKey{
+			studentID: s.StudentID,
+			courseID:  s.CourseID,
+			dateStr:   s.Timestamp.UTC().Format("2006-01-02"),
+		}
+		existing, exists := byKey[k]
+		if !exists {
+			byKey[k] = s
+			continue
+		}
+		// Prefer "scraped" over "reconstructed", or newer timestamp
+		if s.Source == "scraped" && existing.Source != "scraped" {
+			byKey[k] = s
+		} else if s.Source == existing.Source && s.Timestamp.After(existing.Timestamp) {
+			byKey[k] = s
+		}
+	}
+
+	result := make([]GradeSnapshot, 0, len(byKey))
+	for _, s := range byKey {
+		result = append(result, s)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].StudentName != result[j].StudentName {
+			return result[i].StudentName < result[j].StudentName
+		}
+		if result[i].CourseName != result[j].CourseName {
+			return result[i].CourseName < result[j].CourseName
+		}
+		return result[i].Timestamp.Before(result[j].Timestamp)
+	})
+	return result
+}
+
+func saveGradeHistory(outputDir string, snaps []GradeSnapshot) error {
+	if err := os.MkdirAll(outputDir, 0755); err != nil {
+		return err
+	}
+	historyJSON := filepath.Join(outputDir, "grade_history.json")
+	jb, err := json.MarshalIndent(snaps, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(historyJSON, jb, 0644); err != nil {
+		return err
+	}
+
+	historyCSV := filepath.Join(outputDir, "grade_history.csv")
+	f, err := os.Create(historyCSV)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	w := csv.NewWriter(f)
+	_ = w.Write([]string{"Date", "Timestamp", "Student ID", "Student Name", "Course ID", "Course Name", "Score (%)", "Grade", "Source"})
+	for _, s := range snaps {
+		_ = w.Write([]string{
+			s.Timestamp.UTC().Format("2006-01-02"),
+			s.Timestamp.UTC().Format(time.RFC3339),
+			strconv.Itoa(s.StudentID),
+			s.StudentName,
+			strconv.Itoa(s.CourseID),
+			s.CourseName,
+			fmt.Sprintf("%.2f%%", s.Score),
+			s.Grade,
+			s.Source,
+		})
+	}
+	w.Flush()
+	return w.Error()
+}
+
+func calculateCourseTrends(data []CourseGradeRecord, outputDir string, now time.Time) []CourseGradeRecord {
+	historyJSONPath := filepath.Join(outputDir, "grade_history.json")
+	existing := loadGradeHistory(historyJSONPath)
+	todayStr := now.UTC().Format("2006-01-02")
+
+	// Count existing prior-day snapshots per (StudentID, CourseID)
+	type courseKey struct {
+		studentID int
+		courseID  int
+	}
+	priorCount := make(map[courseKey]int)
+	for _, s := range existing {
+		if s.Timestamp.UTC().Format("2006-01-02") < todayStr {
+			priorCount[courseKey{s.StudentID, s.CourseID}]++
+		}
+	}
+
+	allSnaps := append([]GradeSnapshot(nil), existing...)
+	for _, c := range data {
+		if c.OverallScore == nil {
+			continue
+		}
+		ck := courseKey{c.StudentID, c.CourseID}
+		if priorCount[ck] == 0 {
+			reconstructed := reconstructCourseHistory(c, now)
+			allSnaps = append(allSnaps, reconstructed...)
+		}
+		gradeStr := scoreToLetterGrade(*c.OverallScore)
+		if c.OverallGrade != nil && strings.TrimSpace(*c.OverallGrade) != "" {
+			gradeStr = strings.TrimSpace(*c.OverallGrade)
+		}
+		allSnaps = append(allSnaps, GradeSnapshot{
+			Timestamp:   now.UTC(),
+			StudentID:   c.StudentID,
+			StudentName: c.StudentName,
+			CourseID:    c.CourseID,
+			CourseName:  c.CourseName,
+			Score:       math.Round(*c.OverallScore*100) / 100,
+			Grade:       gradeStr,
+			Source:      "scraped",
+		})
+	}
+
+	allSnaps = deduplicateSnapshots(allSnaps)
+	_ = saveGradeHistory(outputDir, allSnaps)
+
+	// Index sorted snapshots per course
+	byCourse := make(map[courseKey][]GradeSnapshot)
+	for _, s := range allSnaps {
+		ck := courseKey{s.StudentID, s.CourseID}
+		byCourse[ck] = append(byCourse[ck], s)
+	}
+
+	targetWoW := now.Add(-7 * 24 * time.Hour)
+	minWindow := now.Add(-14 * 24 * time.Hour)
+	maxWindow := now.Add(-3 * 24 * time.Hour)
+
+	result := make([]CourseGradeRecord, len(data))
+	for i, c := range data {
+		cCopy := c
+		if c.OverallScore == nil {
+			cCopy.Trend = &CourseTrend{
+				Direction:      "new",
+				FormattedDelta: "-",
+			}
+			result[i] = cCopy
+			continue
+		}
+
+		ck := courseKey{c.StudentID, c.CourseID}
+		snaps := byCourse[ck]
+
+		// Keep up to the last 8 weekly/daily points for sparkline & progression
+		startIdx := 0
+		if len(snaps) > 8 {
+			startIdx = len(snaps) - 8
+		}
+		var historyPts []HistoryPoint
+		for _, s := range snaps[startIdx:] {
+			historyPts = append(historyPts, HistoryPoint{
+				Date:   s.Timestamp.UTC().Format("2006-01-02"),
+				Score:  s.Score,
+				Grade:  s.Grade,
+				Source: s.Source,
+			})
+		}
+
+		// Select best Week-over-Week comparison snapshot
+		var bestSnap *GradeSnapshot
+		var bestDiff time.Duration
+		var fallbackSnap *GradeSnapshot
+
+		for idx := range snaps {
+			s := &snaps[idx]
+			sDate := s.Timestamp.UTC().Format("2006-01-02")
+			if sDate >= todayStr {
+				continue
+			}
+			fallbackSnap = s // most recent prior-day snapshot
+			if !s.Timestamp.Before(minWindow) && !s.Timestamp.After(maxWindow) {
+				diff := s.Timestamp.Sub(targetWoW)
+				if diff < 0 {
+					diff = -diff
+				}
+				if bestSnap == nil || diff < bestDiff {
+					bestSnap = s
+					bestDiff = diff
+				}
+			}
+		}
+		if bestSnap == nil {
+			bestSnap = fallbackSnap
+		}
+
+		if bestSnap == nil {
+			cCopy.Trend = &CourseTrend{
+				Direction:      "new",
+				FormattedDelta: "-",
+				HistoryPoints:  historyPts,
+			}
+		} else {
+			prevScore := math.Round(bestSnap.Score*100) / 100
+			delta := math.Round((*c.OverallScore-prevScore)*100) / 100
+			direction := "flat"
+			formatted := "▬  0.00%"
+			if delta >= 0.05 {
+				direction = "up"
+				formatted = fmt.Sprintf("▲ +%.2f%%", delta)
+			} else if delta <= -0.05 {
+				direction = "down"
+				formatted = fmt.Sprintf("▼ %.2f%%", delta)
+			} else {
+				delta = 0.0
+			}
+			cCopy.Trend = &CourseTrend{
+				PreviousScore:  &prevScore,
+				PreviousGrade:  bestSnap.Grade,
+				PreviousDate:   bestSnap.Timestamp.UTC().Format("2006-01-02"),
+				DeltaWoW:       &delta,
+				Direction:      direction,
+				FormattedDelta: formatted,
+				HistoryPoints:  historyPts,
+			}
+		}
+		result[i] = cCopy
+	}
+	return result
+}
+
+func formatProgressionSummary(t *CourseTrend) string {
+	if t == nil || len(t.HistoryPoints) < 2 {
+		return ""
+	}
+	pts := t.HistoryPoints
+	// Select milestone points (first, points where score changed, previous-week anchor, and final "Now")
+	var selected []HistoryPoint
+	for idx, p := range pts {
+		isFirst := idx == 0
+		isLast := idx == len(pts)-1
+		isPrevAnchor := idx == len(pts)-2
+		changed := len(selected) == 0 || math.Abs(p.Score-selected[len(selected)-1].Score) >= 0.05
+		if isFirst || isLast || isPrevAnchor || changed {
+			selected = append(selected, p)
+		}
+	}
+	if len(selected) > 5 {
+		trimmed := make([]HistoryPoint, 0, 5)
+		trimmed = append(trimmed, selected[0])
+		trimmed = append(trimmed, selected[len(selected)-4:]...)
+		selected = trimmed
+	}
+
+	parts := make([]string, 0, len(selected))
+	for idx, p := range selected {
+		lbl := p.Date
+		if idx == len(selected)-1 {
+			lbl = "Now"
+		} else if parsed, err := time.Parse("2006-01-02", p.Date); err == nil {
+			lbl = parsed.Format("Jan 2")
+		}
+		parts = append(parts, fmt.Sprintf("%.1f%% (%s)", p.Score, lbl))
+	}
+	return strings.Join(parts, " ──► ")
+}
+
+func renderSparklineSVG(t *CourseTrend) string {
+	if t == nil || len(t.HistoryPoints) < 2 {
+		return ""
+	}
+	pts := t.HistoryPoints
+	minVal, maxVal := pts[0].Score, pts[0].Score
+	for _, p := range pts[1:] {
+		if p.Score < minVal {
+			minVal = p.Score
+		}
+		if p.Score > maxVal {
+			maxVal = p.Score
+		}
+	}
+	if maxVal-minVal < 4.0 {
+		mid := (minVal + maxVal) / 2.0
+		minVal = mid - 2.0
+		maxVal = mid + 2.0
+	}
+
+	const (
+		padX = 3.0
+		padY = 4.0
+		w    = 70.0
+		h    = 14.0
+	)
+	var polyPts []string
+	var lastX, lastY float64
+	n := len(pts)
+	for idx, p := range pts {
+		x := padX + (float64(idx)/float64(n-1))*w
+		y := padY + h - ((p.Score-minVal)/(maxVal-minVal))*h
+		polyPts = append(polyPts, fmt.Sprintf("%.1f,%.1f", x, y))
+		if idx == n-1 {
+			lastX, lastY = x, y
+		}
+	}
+
+	sparkClass := "sparkline spark-flat"
+	switch t.Direction {
+	case "up":
+		sparkClass = "sparkline spark-up"
+	case "down":
+		sparkClass = "sparkline spark-down"
+	}
+
+	return fmt.Sprintf(`<svg class="%s" width="76" height="22" viewBox="0 0 76 22" aria-hidden="true" focusable="false"><polyline fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" points="%s"/><circle cx="%.1f" cy="%.1f" r="2.3" fill="currentColor"/></svg>`,
+		sparkClass, strings.Join(polyPts, " "), lastX, lastY)
+}
+
 func exportData(outputDir string, data []CourseGradeRecord) error {
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
 		return err
@@ -1462,6 +2024,8 @@ func exportData(outputDir string, data []CourseGradeRecord) error {
 		"Grading Period",
 		"Current Score (%)",
 		"Current Grade",
+		"Trend (WoW)",
+		"Previous Score (%)",
 	})
 	for _, c := range data {
 		gp := ""
@@ -1476,6 +2040,16 @@ func exportData(outputDir string, data []CourseGradeRecord) error {
 		if c.OverallGrade != nil && *c.OverallGrade != "" {
 			gradeStr = *c.OverallGrade
 		}
+		trendStr := "-"
+		prevStr := "N/A"
+		if c.Trend != nil {
+			if c.Trend.FormattedDelta != "" {
+				trendStr = strings.ReplaceAll(c.Trend.FormattedDelta, "  ", " ")
+			}
+			if c.Trend.PreviousScore != nil {
+				prevStr = fmt.Sprintf("%s%%", formatFloatTrim(*c.Trend.PreviousScore))
+			}
+		}
 		_ = cw.Write([]string{
 			c.StudentName,
 			strconv.Itoa(c.CourseID),
@@ -1484,11 +2058,14 @@ func exportData(outputDir string, data []CourseGradeRecord) error {
 			gp,
 			scoreStr,
 			gradeStr,
+			trendStr,
+			prevStr,
 		})
 	}
 	cw.Flush()
 	cf.Close()
 	fmt.Printf("%sSaved courses summary to: %s%s\n", ColorBoldGreen, coursesCSV, ColorReset)
+	fmt.Printf("%sSaved grade history to: %s%s\n", ColorBoldGreen, filepath.Join(outputDir, "grade_history.csv"), ColorReset)
 
 	// 3. Export Assignment Weights CSV
 	weightsCSV := filepath.Join(outputDir, "assignment_weights.csv")
@@ -1657,8 +2234,8 @@ func exportMarkdown(outputDir string, data []CourseGradeRecord, cacheNotice stri
 		sb.WriteString("- **Data Source**: Live Canvas API\n")
 	}
 	sb.WriteString("\n## 1. Courses Overview\n\n")
-	sb.WriteString("| Student | Course Name | Course ID | Score (%) | Letter Grade | Assignments | Weight Categories |\n")
-	sb.WriteString("| :--- | :--- | :---: | :---: | :---: | :---: | :--- |\n")
+	sb.WriteString("| Student | Course Name | Course ID | Score (%) | Letter Grade | Trend (WoW) | Assignments | Weight Categories |\n")
+	sb.WriteString("| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :--- |\n")
 
 	for _, c := range data {
 		scoreStr := "N/A"
@@ -1668,6 +2245,13 @@ func exportMarkdown(outputDir string, data []CourseGradeRecord, cacheNotice stri
 		gradeStr := "-"
 		if c.OverallGrade != nil && *c.OverallGrade != "" {
 			gradeStr = *c.OverallGrade
+		}
+		trendStr := "-"
+		if c.Trend != nil && c.Trend.FormattedDelta != "" {
+			trendStr = strings.ReplaceAll(c.Trend.FormattedDelta, "  ", " ")
+			if c.Trend.PreviousScore != nil {
+				trendStr = fmt.Sprintf("%s (prev: %.2f%%)", trendStr, *c.Trend.PreviousScore)
+			}
 		}
 
 		var weights []string
@@ -1686,12 +2270,13 @@ func exportMarkdown(outputDir string, data []CourseGradeRecord, cacheNotice stri
 			weightStr = strings.Join(weights, ", ")
 		}
 
-		sb.WriteString(fmt.Sprintf("| %s | %s | %d | %s | %s | %d | %s |\n",
+		sb.WriteString(fmt.Sprintf("| %s | %s | %d | %s | %s | %s | %d | %s |\n",
 			mdEscape(c.StudentName),
 			mdEscape(c.CourseName),
 			c.CourseID,
 			scoreStr,
 			mdEscape(gradeStr),
+			mdEscape(trendStr),
 			len(c.Assignments),
 			mdEscape(weightStr),
 		))
@@ -1700,6 +2285,15 @@ func exportMarkdown(outputDir string, data []CourseGradeRecord, cacheNotice stri
 	// Action Items Section for AI quick consumption
 	var actionItems []string
 	for _, c := range data {
+		if c.Trend != nil && c.Trend.DeltaWoW != nil && *c.Trend.DeltaWoW <= -2.0 && c.OverallScore != nil && c.Trend.PreviousScore != nil {
+			actionItems = append(actionItems, fmt.Sprintf("- **%s** | **%s** — ⚠️ **Grade Drop Alert**: Course grade dropped **%.2f%% WoW** (from `%.2f%%` to `%.2f%%`)",
+				mdEscape(c.StudentName),
+				mdEscape(c.CourseName),
+				*c.Trend.DeltaWoW,
+				*c.Trend.PreviousScore,
+				*c.OverallScore,
+			))
+		}
 		for _, a := range c.Assignments {
 			dueTime, hasDue := parseDueTime(a.DueAt)
 			isOverdueUnsubmitted := hasDue && dueTime.Before(now) && a.Score == nil && !a.Excused && a.SubmittedAt == nil
@@ -1757,8 +2351,22 @@ func exportMarkdown(outputDir string, data []CourseGradeRecord, cacheNotice stri
 			gradeHdr = *c.OverallGrade
 		}
 
-		sb.WriteString(fmt.Sprintf("### %s — %s (Current: %s | Grade: %s)\n\n",
-			mdEscape(c.StudentName), mdEscape(c.CourseName), scoreHdr, mdEscape(gradeHdr)))
+		trendHdr := ""
+		if c.Trend != nil && c.Trend.FormattedDelta != "" && c.Trend.FormattedDelta != "-" {
+			cleanDelta := strings.ReplaceAll(c.Trend.FormattedDelta, "  ", " ")
+			if c.Trend.PreviousScore != nil {
+				trendHdr = fmt.Sprintf(" | Trend: %s WoW, prev: %.2f%%", cleanDelta, *c.Trend.PreviousScore)
+			} else {
+				trendHdr = fmt.Sprintf(" | Trend: %s WoW", cleanDelta)
+			}
+		}
+
+		sb.WriteString(fmt.Sprintf("### %s — %s (Current: %s | Grade: %s%s)\n\n",
+			mdEscape(c.StudentName), mdEscape(c.CourseName), scoreHdr, mdEscape(gradeHdr), mdEscape(trendHdr)))
+
+		if prog := formatProgressionSummary(c.Trend); prog != "" {
+			sb.WriteString(fmt.Sprintf("> **Grade Trajectory**: `%s`\n\n", prog))
+		}
 
 		if len(c.Assignments) == 0 {
 			sb.WriteString("_No assignments matching active filters._\n\n")
@@ -1941,6 +2549,28 @@ func exportHTML(outputDir string, data []CourseGradeRecord, cacheNotice string) 
     .badge-yellow { background: var(--yellow-bg); color: var(--yellow-fg); }
     .badge-red { background: var(--red-bg); color: var(--red-fg); }
     .badge-cyan { background: var(--cyan-bg); color: var(--cyan-fg); }
+    .badge-muted { background: var(--surface-subtle); color: var(--text-muted); border: 1px solid var(--border); }
+    .trend-cell {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.45rem;
+      white-space: nowrap;
+    }
+    .sparkline {
+      vertical-align: middle;
+      overflow: visible;
+    }
+    .spark-up { color: var(--green-fg); }
+    .spark-down { color: var(--red-fg); }
+    .spark-flat { color: var(--text-muted); }
+    .progression-bar {
+      padding: 0.45rem 1.25rem;
+      font-size: 0.82rem;
+      color: var(--text-muted);
+      background: var(--bg);
+      border-bottom: 1px solid var(--border);
+      font-variant-numeric: tabular-nums;
+    }
     .table-wrapper {
       overflow: auto;
       max-inline-size: 100%;
@@ -2036,6 +2666,7 @@ func exportHTML(outputDir string, data []CourseGradeRecord, cacheNotice string) 
       td:nth-child(4)::before { content: var(--label-4) ": "; font-weight: 600; color: var(--text-muted); text-align: left; }
       td:nth-child(5)::before { content: var(--label-5) ": "; font-weight: 600; color: var(--text-muted); text-align: left; }
       td:nth-child(6)::before { content: var(--label-6) ": "; font-weight: 600; color: var(--text-muted); text-align: left; }
+      td:nth-child(7)::before { content: var(--label-7) ": "; font-weight: 600; color: var(--text-muted); text-align: left; }
     }
   </style>
 </head>
@@ -2061,7 +2692,7 @@ func exportHTML(outputDir string, data []CourseGradeRecord, cacheNotice string) 
         <h2 class="card-title">Courses Summary</h2>
       </div>
       <div tabindex="0" role="region" aria-labelledby="overview-caption" class="table-wrapper">
-        <table style="--label-2: 'Course'; --label-3: 'Score'; --label-4: 'Grade'; --label-5: 'Assignments'; --label-6: 'Weight Categories';">
+        <table style="--label-2: 'Course'; --label-3: 'Score'; --label-4: 'Grade'; --label-5: 'Trend (WoW)'; --label-6: 'Assignments'; --label-7: 'Weight Categories';">
           <caption id="overview-caption">Canvas Gradebook Overview across students and courses</caption>
           <thead>
             <tr>
@@ -2069,6 +2700,7 @@ func exportHTML(outputDir string, data []CourseGradeRecord, cacheNotice string) 
               <th scope="col">Course Name</th>
               <th scope="col" class="num">Score</th>
               <th scope="col">Grade</th>
+              <th scope="col">Trend (WoW)</th>
               <th scope="col" class="num">Asgs</th>
               <th scope="col">Weight Categories</th>
             </tr>
@@ -2116,11 +2748,39 @@ func exportHTML(outputDir string, data []CourseGradeRecord, cacheNotice string) 
 			}
 		}
 
+		trendBadge := "badge-muted"
+		trendLabel := "-"
+		trendTooltip := ""
+		sparkSVG := ""
+		if c.Trend != nil {
+			if c.Trend.FormattedDelta != "" {
+				trendLabel = strings.ReplaceAll(c.Trend.FormattedDelta, "  ", " ")
+			}
+			switch c.Trend.Direction {
+			case "up":
+				trendBadge = "badge-green"
+			case "down":
+				trendBadge = "badge-red"
+			case "flat":
+				trendBadge = "badge-muted"
+			}
+			if c.Trend.PreviousScore != nil {
+				trendTooltip = fmt.Sprintf("Previous week (%s): %.2f%%", c.Trend.PreviousDate, *c.Trend.PreviousScore)
+			}
+			sparkSVG = renderSparklineSVG(c.Trend)
+		}
+
+		titleAttr := ""
+		if trendTooltip != "" {
+			titleAttr = fmt.Sprintf(` title="%s"`, html.EscapeString(trendTooltip))
+		}
+
 		sb.WriteString(fmt.Sprintf(`            <tr>
               <th scope="row">%s</th>
               <td><a class="asg-link" href="#course-%d">%s</a></td>
               <td class="num"><strong>%s</strong></td>
               <td><span class="badge %s">%s</span></td>
+              <td><span class="trend-cell"%s><span class="badge %s">%s</span>%s</span></td>
               <td class="num">%d</td>
               <td>%s</td>
             </tr>
@@ -2131,6 +2791,10 @@ func exportHTML(outputDir string, data []CourseGradeRecord, cacheNotice string) 
 			html.EscapeString(scoreStr),
 			gradeBadge,
 			html.EscapeString(gradeStr),
+			titleAttr,
+			trendBadge,
+			html.EscapeString(trendLabel),
+			sparkSVG,
 			len(c.Assignments),
 			html.EscapeString(weightStr),
 		))
@@ -2157,15 +2821,37 @@ func exportHTML(outputDir string, data []CourseGradeRecord, cacheNotice string) 
 		}
 		captionID := fmt.Sprintf("course-caption-%d", i)
 
+		trendHdrHTML := ""
+		if c.Trend != nil && c.Trend.FormattedDelta != "" && c.Trend.FormattedDelta != "-" {
+			tBadge := "badge-muted"
+			switch c.Trend.Direction {
+			case "up":
+				tBadge = "badge-green"
+			case "down":
+				tBadge = "badge-red"
+			}
+			cleanDelta := strings.ReplaceAll(c.Trend.FormattedDelta, "  ", " ")
+			prevInfo := ""
+			if c.Trend.PreviousScore != nil {
+				prevInfo = fmt.Sprintf(" (prev: %.2f%%)", *c.Trend.PreviousScore)
+			}
+			trendHdrHTML = fmt.Sprintf("\n          <span class=\"badge %s\">Trend: %s WoW%s</span>",
+				tBadge, html.EscapeString(cleanDelta), html.EscapeString(prevInfo))
+		}
+
 		sb.WriteString(fmt.Sprintf(`    <section class="card" id="course-%d">
       <div class="card-header">
         <h2 class="card-title">%s — %s</h2>
-        <div>
+        <div class="trend-cell">
           <span class="badge badge-cyan">Current: %s</span>
-          <span class="badge badge-green">Grade: %s</span>
+          <span class="badge badge-green">Grade: %s</span>%s
         </div>
       </div>
-`, i, html.EscapeString(c.StudentName), html.EscapeString(c.CourseName), html.EscapeString(scoreHdr), html.EscapeString(gradeHdr)))
+`, i, html.EscapeString(c.StudentName), html.EscapeString(c.CourseName), html.EscapeString(scoreHdr), html.EscapeString(gradeHdr), trendHdrHTML))
+
+		if prog := formatProgressionSummary(c.Trend); prog != "" {
+			sb.WriteString(fmt.Sprintf(`      <div class="progression-bar"><strong>Grade Trajectory:</strong> %s</div>`+"\n", html.EscapeString(prog)))
+		}
 
 		if len(c.Assignments) == 0 {
 			sb.WriteString(`      <div style="padding: 1rem 1.25rem; color: var(--text-muted);">No assignments matching active filters.</div>
@@ -2285,9 +2971,9 @@ func displayTerminalSummary(data []CourseGradeRecord, cacheNotice string, filter
 	if cacheNotice != "" {
 		fmt.Printf("%s⚡ [USING CACHED RESULTS] %s%s\n", ColorBoldYellow, cacheNotice, ColorReset)
 	}
-	fmt.Printf("%s────────────────────────────── Canvas Gradebook Overview ──────────────────────────────%s\n", ColorBoldMagenta, ColorReset)
-	fmt.Printf("%-16s │ %-26s │ %10s │ %5s │ %5s │ %s\n", "Student", "Course Name", "Score", "Grade", "Asgs", "Weight Categories")
-	fmt.Println(strings.Repeat("─", 110))
+	fmt.Printf("%s─────────────────────────────────── Canvas Gradebook Overview ───────────────────────────────────%s\n", ColorBoldMagenta, ColorReset)
+	fmt.Printf("%-16s │ %-26s │ %10s │ %5s │ %11s │ %5s │ %s\n", "Student", "Course Name", "Score", "Grade", "Trend (WoW)", "Asgs", "Weight Categories")
+	fmt.Println(strings.Repeat("─", 124))
 
 	for _, c := range data {
 		scoreStr := "N/A"
@@ -2297,6 +2983,20 @@ func displayTerminalSummary(data []CourseGradeRecord, cacheNotice string, filter
 		gradeStr := "-"
 		if c.OverallGrade != nil && *c.OverallGrade != "" {
 			gradeStr = *c.OverallGrade
+		}
+
+		trendStr := "-"
+		trendColor := ColorDim
+		if c.Trend != nil && c.Trend.FormattedDelta != "" {
+			trendStr = c.Trend.FormattedDelta
+			switch c.Trend.Direction {
+			case "up":
+				trendColor = ColorBoldGreen
+			case "down":
+				trendColor = ColorBoldRed
+			default:
+				trendColor = ColorDim
+			}
 		}
 
 		var weights []string
@@ -2315,16 +3015,17 @@ func displayTerminalSummary(data []CourseGradeRecord, cacheNotice string, filter
 			weightStr = strings.Join(weights, ", ")
 		}
 
-		fmt.Printf("%s%-16s%s │ %s%-26s%s │ %s%10s%s │ %s%5s%s │ %5d │ %s\n",
+		fmt.Printf("%s%-16s%s │ %s%-26s%s │ %s%10s%s │ %s%5s%s │ %s%11s%s │ %5d │ %s\n",
 			ColorBoldCyan, truncate(c.StudentName, 16), ColorReset,
 			ColorBoldWhite, truncate(c.CourseName, 26), ColorReset,
 			ColorBoldGreen, scoreStr, ColorReset,
 			ColorBoldYellow, gradeStr, ColorReset,
+			trendColor, trendStr, ColorReset,
 			len(c.Assignments),
-			truncate(weightStr, 50),
+			truncate(weightStr, 46),
 		)
 	}
-	fmt.Println(strings.Repeat("─", 110))
+	fmt.Println(strings.Repeat("─", 124))
 	fmt.Println()
 
 	for _, c := range data {
@@ -2340,12 +3041,33 @@ func displayTerminalSummary(data []CourseGradeRecord, cacheNotice string, filter
 			gradeHdr = *c.OverallGrade
 		}
 
-		fmt.Printf("╭─ %s%s%s — %s%s%s (Current: %s%s%s | Grade: %s%s%s)\n",
+		trendHdr := ""
+		if c.Trend != nil && c.Trend.FormattedDelta != "" && c.Trend.FormattedDelta != "-" {
+			tColor := ColorDim
+			switch c.Trend.Direction {
+			case "up":
+				tColor = ColorBoldGreen
+			case "down":
+				tColor = ColorBoldRed
+			}
+			cleanDelta := strings.ReplaceAll(c.Trend.FormattedDelta, "  ", " ")
+			prevPart := ""
+			if c.Trend.PreviousScore != nil {
+				prevPart = fmt.Sprintf(" %s(prev: %.2f%%)%s", ColorDim, *c.Trend.PreviousScore, ColorReset)
+			}
+			trendHdr = fmt.Sprintf(" | Trend: %s%s WoW%s%s", tColor, cleanDelta, ColorReset, prevPart)
+		}
+
+		fmt.Printf("╭─ %s%s%s — %s%s%s (Current: %s%s%s | Grade: %s%s%s%s)\n",
 			ColorBoldCyan, c.StudentName, ColorReset,
 			ColorBoldWhite, c.CourseName, ColorReset,
 			ColorBoldGreen, scoreHdr, ColorReset,
 			ColorBoldYellow, gradeHdr, ColorReset,
+			trendHdr,
 		)
+		if prog := formatProgressionSummary(c.Trend); prog != "" {
+			fmt.Printf("│ %sGrade Trajectory:%s %s\n", ColorDim, ColorReset, prog)
+		}
 		fmt.Printf("│ %-38s │ %-24s │ %10s │ %8s │ %-14s │ %10s\n",
 			"Assignment", "Category (Weight)", "Score", "Percent", "Status", "Due Date")
 		fmt.Printf("├%s┼%s┼%s┼%s┼%s┼%s\n",
@@ -2413,11 +3135,13 @@ from Canvas LMS into JSON/CSV files and formatted terminal tables.
 
 %sGENERAL, AUTHENTICATION & OUTPUT FLAGS:%s
   --help, -h             Show this help guide and exit
+  --version, -v          Print version information and exit
   --fresh                Bypass local CACHE_TIMER and fetch live data from Canvas
   --headed               Launch visible browser window for login/MFA debugging
   --output-dir <dir>     Directory to save exported files (.env: OUTPUT_DIR=output)
   --web                  Generate a single-file HTML report (<output-dir>/canvas_grades.html) and open it
   --markdown             Generate an AI-ready Markdown report (<output-dir>/canvas_grades.md)
+  --no-trend             Disable grade history & week-over-week trend calculation (.env: DISABLE_TREND=true)
 
 %sSTUDENT & COURSE FILTERS:%s
   --student <name>       Filter by student name (e.g. --student Emma or --student Tyler)
@@ -2455,6 +3179,8 @@ from Canvas LMS into JSON/CSV files and formatted terminal tables.
                          • score-desc           Score percentage (highest to lowest)
                          • grade, grade-asc     Letter grade / percentage (A to F, highest to lowest)
                          • grade-desc           Letter grade / percentage (F to A, lowest to highest)
+                         • trend, trend-asc     Week-over-week trend (biggest drops first)
+                         • trend-desc           Week-over-week trend (biggest gains first)
                          • weight, weight-desc  Category weight (highest weight %% to lowest)
 
 %sCONFIGURATION (.env FILE OPTIONS):%s
@@ -2504,11 +3230,14 @@ from Canvas LMS into JSON/CSV files and formatted terminal tables.
 func main() {
 	flag.Usage = printHelp
 
+	versionFlag := flag.Bool("version", false, "Print version information and exit")
+	vFlag := flag.Bool("v", false, "Print version information and exit (shorthand)")
 	headed := flag.Bool("headed", false, "Launch browser in headed mode (visible window) for MFA or debugging")
 	fresh := flag.Bool("fresh", false, "Bypass local CACHE_TIMER and fetch live data from Canvas")
 	outputDir := flag.String("output-dir", "", "Directory to save exported JSON/CSV/HTML/MD files (overrides OUTPUT_DIR in .env)")
 	webFlag := flag.Bool("web", false, "Generate a single-file HTML report and open it in the browser")
 	markdownFlag := flag.Bool("markdown", false, "Generate an AI-ready Markdown report (canvas_grades.md)")
+	noTrendFlag := flag.Bool("no-trend", false, "Disable grade history and week-over-week trend calculation")
 	courseFilter := flag.String("course", "", "Filter results by specific course ID or name")
 	studentFilter := flag.String("student", "", "Filter results by student name (e.g., Emma or Tyler)")
 
@@ -2525,6 +3254,11 @@ func main() {
 	sortFlag := flag.String("sort", "", "Sort results by: date, date-desc, status, score, score-desc, grade, grade-desc, weight")
 
 	flag.Parse()
+
+	if *versionFlag || *vFlag {
+		fmt.Printf("canvas-scraper %s (%s/%s)\n", Version, runtime.GOOS, runtime.GOARCH)
+		return
+	}
 
 	cfg := loadConfigFromEnv()
 	if cfg.CanvasURL == "" {
@@ -2587,6 +3321,9 @@ func main() {
 	}
 	if *sortFlag != "" {
 		cfg.SortBy = *sortFlag
+	}
+	if *noTrendFlag {
+		cfg.DisableTrend = true
 	}
 
 	var data []CourseGradeRecord
@@ -2727,6 +3464,10 @@ func main() {
 
 	if cfg.SkipUngradedItems {
 		data = filterUngradedItems(data)
+	}
+
+	if !cfg.DisableTrend {
+		data = calculateCourseTrends(data, *outputDir, time.Now())
 	}
 
 	if cfg.StudentFilter != "" {

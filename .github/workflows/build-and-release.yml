@@ -60,7 +60,15 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: 0
         run: |
-          go build -ldflags="-s -w" -o "${{ matrix.output_name }}" main.go
+          TAG="${{ github.ref_name }}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.tag_name }}" ]; then
+            TAG="${{ github.event.inputs.tag_name }}"
+          fi
+          if [ -n "$TAG" ] && [ "$TAG" != "main" ]; then
+            go build -ldflags="-s -w -X main.Version=${TAG}" -o "${{ matrix.output_name }}" main.go
+          else
+            go build -ldflags="-s -w" -o "${{ matrix.output_name }}" main.go
+          fi
 
       - name: Package Release Archive
         id: package
